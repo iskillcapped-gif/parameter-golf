@@ -62,6 +62,7 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    shared_block_count = int(os.environ.get("SHARED_BLOCK_COUNT", num_layers))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -650,6 +651,7 @@ class GPT(nn.Module):
         self,
         vocab_size: int,
         num_layers: int,
+        shared_block_count: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -663,6 +665,14 @@ class GPT(nn.Module):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if shared_block_count <= 0:
+            raise ValueError(f"shared_block_count must be positive, got {shared_block_count}")
+        if shared_block_count > num_layers:
+            raise ValueError(
+                f"shared_block_count={shared_block_count} must be <= num_layers={num_layers}"
+            )
+        self.num_layers = num_layers
+        self.shared_block_count = shared_block_count
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
@@ -681,7 +691,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(num_layers)
+                for i in range(shared_block_count)
             ]
         )
         self.final_norm = RMSNorm()
@@ -689,6 +699,9 @@ class GPT(nn.Module):
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
+
+    def _block_for_layer(self, layer_idx: int) -> Block:
+        return self.blocks[layer_idx % self.shared_block_count]
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -705,12 +718,12 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self._block_for_layer(i)(x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self._block_for_layer(self.num_encoder_layers + i)(x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -826,6 +839,7 @@ def main() -> None:
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
+        shared_block_count=args.shared_block_count,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -894,11 +908,12 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    log0(f"model_depth:effective_layers:{args.num_layers} unique_blocks:{args.shared_block_count}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
-        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
+        f"tie_embeddings:{args.tie_embeddings} shared_block_count:{args.shared_block_count} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
