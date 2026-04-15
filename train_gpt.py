@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import glob
 import io
+import inspect
 import math
 import os
 import random
@@ -26,6 +27,11 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+try:
+    _SDPA_SUPPORTS_ENABLE_GQA = "enable_gqa" in inspect.signature(F.scaled_dot_product_attention).parameters
+except (TypeError, ValueError):
+    _SDPA_SUPPORTS_ENABLE_GQA = False
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -592,7 +598,7 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        try:
+        if _SDPA_SUPPORTS_ENABLE_GQA:
             y = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -601,9 +607,7 @@ class CausalSelfAttention(nn.Module):
                 is_causal=True,
                 enable_gqa=(self.num_kv_heads != self.num_heads),
             )
-        except TypeError as exc:
-            if "enable_gqa" not in str(exc):
-                raise
+        else:
             if self.num_kv_heads != self.num_heads:
                 kv_repeat = self.num_heads // self.num_kv_heads
                 k = k.repeat_interleave(kv_repeat, dim=1)
