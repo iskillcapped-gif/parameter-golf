@@ -68,7 +68,9 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
-    shared_block_count = int(os.environ.get("SHARED_BLOCK_COUNT", num_layers))
+    middle_start_layer = int(os.environ.get("MIDDLE_START_LAYER", num_layers))
+    middle_end_layer = int(os.environ.get("MIDDLE_END_LAYER", num_layers))
+    middle_shared_block_count = int(os.environ.get("MIDDLE_SHARED_BLOCK_COUNT", 1))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -670,7 +672,9 @@ class GPT(nn.Module):
         self,
         vocab_size: int,
         num_layers: int,
-        shared_block_count: int,
+        middle_start_layer: int,
+        middle_end_layer: int,
+        middle_shared_block_count: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -684,14 +688,27 @@ class GPT(nn.Module):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
-        if shared_block_count <= 0:
-            raise ValueError(f"shared_block_count must be positive, got {shared_block_count}")
-        if shared_block_count > num_layers:
+        if not (0 <= middle_start_layer <= middle_end_layer <= num_layers):
             raise ValueError(
-                f"shared_block_count={shared_block_count} must be <= num_layers={num_layers}"
+                "middle recurrence window must satisfy "
+                f"0 <= middle_start_layer <= middle_end_layer <= num_layers, got "
+                f"middle_start_layer={middle_start_layer}, middle_end_layer={middle_end_layer}, "
+                f"num_layers={num_layers}"
+            )
+        middle_region_length = middle_end_layer - middle_start_layer
+        if middle_region_length > 0 and middle_shared_block_count <= 0:
+            raise ValueError(
+                f"middle_shared_block_count must be positive for a non-empty middle region, got {middle_shared_block_count}"
+            )
+        if middle_region_length > 0 and middle_shared_block_count > middle_region_length:
+            raise ValueError(
+                f"middle_shared_block_count={middle_shared_block_count} must be <= "
+                f"middle region length {middle_region_length}"
             )
         self.num_layers = num_layers
-        self.shared_block_count = shared_block_count
+        self.middle_start_layer = middle_start_layer
+        self.middle_end_layer = middle_end_layer
+        self.middle_shared_block_count = middle_shared_block_count
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
@@ -700,7 +717,7 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
+        self.pre_blocks = nn.ModuleList(
             [
                 Block(
                     model_dim,
@@ -710,7 +727,33 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(shared_block_count)
+                for _ in range(middle_start_layer)
+            ]
+        )
+        self.middle_blocks = nn.ModuleList(
+            [
+                Block(
+                    model_dim,
+                    num_heads,
+                    num_kv_heads,
+                    mlp_mult,
+                    rope_base,
+                    qk_gain_init,
+                )
+                for _ in range(middle_shared_block_count if middle_region_length > 0 else 0)
+            ]
+        )
+        self.post_blocks = nn.ModuleList(
+            [
+                Block(
+                    model_dim,
+                    num_heads,
+                    num_kv_heads,
+                    mlp_mult,
+                    rope_base,
+                    qk_gain_init,
+                )
+                for _ in range(num_layers - middle_end_layer)
             ]
         )
         self.final_norm = RMSNorm()
@@ -720,7 +763,11 @@ class GPT(nn.Module):
         self._init_weights()
 
     def _block_for_layer(self, layer_idx: int) -> Block:
-        return self.blocks[layer_idx % self.shared_block_count]
+        if layer_idx < self.middle_start_layer:
+            return self.pre_blocks[layer_idx]
+        if layer_idx < self.middle_end_layer:
+            return self.middle_blocks[(layer_idx - self.middle_start_layer) % self.middle_shared_block_count]
+        return self.post_blocks[layer_idx - self.middle_end_layer]
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -858,7 +905,9 @@ def main() -> None:
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
-        shared_block_count=args.shared_block_count,
+        middle_start_layer=args.middle_start_layer,
+        middle_end_layer=args.middle_end_layer,
+        middle_shared_block_count=args.middle_shared_block_count,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -881,7 +930,11 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    block_named_params = (
+        [(f"pre_blocks.{name}", p) for name, p in base_model.pre_blocks.named_parameters()]
+        + [(f"middle_blocks.{name}", p) for name, p in base_model.middle_blocks.named_parameters()]
+        + [(f"post_blocks.{name}", p) for name, p in base_model.post_blocks.named_parameters()]
+    )
     matrix_params = [
         p
         for name, p in block_named_params
@@ -927,12 +980,16 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
-    log0(f"model_depth:effective_layers:{args.num_layers} unique_blocks:{args.shared_block_count}")
+    log0(
+        f"model_depth:effective_layers:{args.num_layers} "
+        f"middle_window:[{args.middle_start_layer},{args.middle_end_layer}) "
+        f"middle_shared_block_count:{args.middle_shared_block_count}"
+    )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
-        f"tie_embeddings:{args.tie_embeddings} shared_block_count:{args.shared_block_count} embed_lr:{token_lr} "
+        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
